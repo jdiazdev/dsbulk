@@ -32,7 +32,9 @@ import com.typesafe.config.Config;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.URL;
+import java.util.concurrent.ThreadLocalRandom;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -40,10 +42,13 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.Mock;
+import org.mockito.Mockito;
 import org.mockito.MockitoAnnotations;
 import org.mockito.stubbing.Answer;
 import software.amazon.awssdk.core.ResponseBytes;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.GetObjectResponse;
 
@@ -51,6 +56,7 @@ class S3URLStreamHandlerTest {
 
   @Mock private Config config;
   @Mock private InputStream mockInputStream;
+  @Mock private OutputStream mockOutputStream;
 
   private AutoCloseable mocks;
 
@@ -130,6 +136,94 @@ class S3URLStreamHandlerTest {
     InputStream stream1 = connection1.getInputStream();
     InputStream stream2 = connection2.getInputStream();
 
+    assertThat(stream1).isNotSameAs(stream2); // Two different URls produce different streams.
+    verify(mockClient, times(2)).getObjectAsBytes(any(GetObjectRequest.class));
+    verify(connection1)
+        .getS3Client(
+            new S3ClientInfo(
+                "region=us-west-1&test=should_cache")); // We got the client for one connection...
+    verify(connection2, never()).getS3Client(any()); // ... but not the second connection.
+  }
+
+  @ParameterizedTest
+  @CsvSource({
+    "s3://test-bucket/test-key,You must provide S3 client credentials in the URL query parameters.",
+    "s3://test-bucket/test-key?profile=default,You must supply an AWS 'region' parameter on S3 URls.",
+    "s3://test-bucket/test-key?region=us-west-1&accessKeyId=secret,Both 'accessKeyId' and 'secretAccessKey' must be present if either one is provided.",
+    "s3://test-bucket/test-key?region=us-west-1&secretAccessKey=secret,Both 'accessKeyId' and 'secretAccessKey' must be present if either one is provided."
+  })
+  void should_require_query_parameters_for_output(String s3Url, String errorMessage)
+      throws IOException {
+    URL url = new URL(s3Url);
+    S3Connection connection = spy((S3Connection) url.openConnection());
+
+    doReturn(mockOutputStream).when(connection).getOutputStream(any(), any(), any());
+
+    Throwable t = catchThrowable(connection::getOutputStream);
+
+    assertThat(t).isNotNull().isInstanceOf(IllegalArgumentException.class).hasMessage(errorMessage);
+  }
+
+  @ParameterizedTest
+  @ValueSource(
+      strings = {
+        // This one uses a profile.
+        "s3://test-bucket/test-key?region=us-west-1&profile=nameNoOneWouldActuallyGiveTheirProfile",
+        // This one uses the default credentials provider.
+        "s3://test-bucket/test-key?region=us-west-1",
+        // This one uses both secret parameters.
+        "s3://test-bucket/test-key?region=us-west-1&accessKeyId=secret&secretAccessKey=alsoSecret"
+      })
+  void should_provide_output_stream_when_parameters_are_correct(String s3Url) throws IOException {
+    URL url = new URL(s3Url);
+    S3Connection connection = spy((S3Connection) url.openConnection());
+
+    doReturn(mockOutputStream).when(connection).getOutputStream(any(), any(), any());
+
+    assertThat(connection.getOutputStream()).isNotNull();
+  }
+
+  @Test
+  void should_cache_clients_for_write() throws IOException {
+    URL url1 = new URL("s3://test-bucket/test-key-1?region=us-west-1&test=should_cache");
+    S3Connection connection1 = spy((S3Connection) url1.openConnection());
+    URL url2 = new URL("s3://test-bucket/test-key-2?region=us-west-1&test=should_cache");
+    S3Connection connection2 = spy((S3Connection) url2.openConnection());
+
+    S3Client mockClient = mock(S3Client.class);
+    when(mockClient.createMultipartUpload((CreateMultipartUploadRequest) any()))
+        .thenAnswer(
+            (Answer<CreateMultipartUploadResponse>)
+                invocation -> {
+                  CreateMultipartUploadResponse mockResponse =
+                      Mockito.mock(CreateMultipartUploadResponse.class);
+                  when(mockResponse.uploadId())
+                      .thenReturn("uploadId" + ThreadLocalRandom.current().nextInt());
+                  return mockResponse;
+                });
+    when(mockClient.createMultipartUpload((CreateMultipartUploadRequest) any()))
+        .thenAnswer(
+            (Answer<CreateMultipartUploadResponse>)
+                invocation -> {
+                  CreateMultipartUploadResponse mockResponse =
+                      Mockito.mock(CreateMultipartUploadResponse.class);
+                  when(mockResponse.uploadId()).thenReturn("uploadId");
+                  return mockResponse;
+                });
+    when(mockClient.getObjectAsBytes(any(GetObjectRequest.class)))
+        .thenAnswer(
+            (Answer<ResponseBytes<GetObjectResponse>>)
+                invocation -> {
+                  GetObjectResponse response = GetObjectResponse.builder().build();
+                  byte[] bytes = new byte[] {};
+                  InputStream is = new ByteArrayInputStream(bytes);
+                  return ResponseBytes.fromInputStream(response, is);
+                });
+    doReturn(mockClient).when(connection1).getS3Client(any());
+
+    OutputStream stream1 = connection1.getOutputStream();
+    OutputStream stream2 = connection2.getOutputStream();
+    stream1.write(null, 0, 0);
     assertThat(stream1).isNotSameAs(stream2); // Two different URls produce different streams.
     verify(mockClient, times(2)).getObjectAsBytes(any(GetObjectRequest.class));
     verify(connection1)

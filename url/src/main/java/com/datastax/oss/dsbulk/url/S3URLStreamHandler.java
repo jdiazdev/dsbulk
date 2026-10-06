@@ -18,6 +18,8 @@ package com.datastax.oss.dsbulk.url;
 import com.datastax.oss.driver.shaded.guava.common.annotations.VisibleForTesting;
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
@@ -30,16 +32,31 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.ProfileCredentialsProvider;
+import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.http.SdkHttpClient;
 import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
+import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
+import software.amazon.awssdk.services.s3.model.CompletedPart;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.GetObjectRequest;
+import software.amazon.awssdk.services.s3.model.UploadPartRequest;
+import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 import software.amazon.awssdk.utils.StringUtils;
 
 /** A {@link URLStreamHandler} for reading from AWS S3 URls. */
@@ -129,8 +146,23 @@ public class S3URLStreamHandler extends URLStreamHandler {
     }
 
     @Override
-    public OutputStream getOutputStream() {
-      throw new UnsupportedOperationException("Writing to S3 has not yet been implemented.");
+    public OutputStream getOutputStream() throws IOException {
+      String bucket = url.getHost();
+      String key = url.getPath().substring(1);
+      String query = url.getQuery();
+      if (StringUtils.isBlank(query)) {
+        throw new IllegalArgumentException(
+            "You must provide S3 client credentials in the URL query parameters.");
+      }
+      S3ClientInfo s3ClientInfo = new S3ClientInfo(query);
+      S3Client s3Client = s3ClientCache.get(s3ClientInfo, this::getS3Client);
+      return getOutputStream(s3Client, bucket, key);
+    }
+
+    @VisibleForTesting
+    OutputStream getOutputStream(S3Client s3Client, String bucket, String key) throws IOException {
+      // S3 requires parts (except the last one) to be >= 5 MB
+      return new S3UploadOutputStream(s3Client, bucket, key, 5 * 1024 * 1024);
     }
   }
 
@@ -222,6 +254,207 @@ public class S3URLStreamHandler extends URLStreamHandler {
     @Override
     public int hashCode() {
       return Objects.hash(region, profile, accessKeyId, secretAccessKey);
+    }
+  }
+
+  private static class S3UploadOutputStream extends OutputStream {
+
+    private static final int QUEUE_CAPACITY = 4;
+
+    private final BlockingQueue<Part> queue = new ArrayBlockingQueue<>(QUEUE_CAPACITY);
+
+    private final int partSize;
+
+    private final ByteArrayOutputStream buffer;
+    private volatile boolean closed;
+
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+
+    private final Future<?> uploadFuture;
+    private volatile Throwable uploadFailure;
+
+    private int partNumber = 1;
+
+    public S3UploadOutputStream(S3Client s3Client, String bucket, String key, int partSize) {
+      this.partSize = partSize;
+      this.buffer = new ByteArrayOutputStream(partSize);
+
+      uploadFuture = executor.submit(() -> runUploader(s3Client, bucket, key));
+    }
+
+    @Override
+    public void write(int b) throws IOException {
+      ensureHealthy();
+      buffer.write(b);
+
+      if (buffer.size() >= partSize) {
+        enqueueCurrentBuffer();
+      }
+    }
+
+    @Override
+    public void write(byte[] b, int off, int len) throws IOException {
+      ensureHealthy();
+      while (len > 0) {
+
+        int remaining = partSize - buffer.size();
+        int chunk = Math.min(remaining, len);
+
+        buffer.write(b, off, chunk);
+
+        off += chunk;
+        len -= chunk;
+
+        if (buffer.size() >= partSize) {
+          enqueueCurrentBuffer();
+        }
+      }
+    }
+
+    @Override
+    public void flush() throws IOException {
+      // no-op
+    }
+
+    @Override
+    public synchronized void close() throws IOException {
+      if (closed) {
+        return;
+      }
+
+      closed = true;
+
+      try {
+
+        if (buffer.size() > 0) {
+          enqueueCurrentBuffer();
+        }
+
+        queue.put(new Part(0, null, true));
+
+        uploadFuture.get();
+
+      } catch (ExecutionException e) {
+        throw new IOException("Multipart upload failed", e.getCause());
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IOException(e);
+      } finally {
+        executor.shutdownNow();
+      }
+    }
+
+    private void ensureHealthy() throws IOException {
+
+      if (uploadFailure != null) {
+        throw new IOException("S3 Upload failed", uploadFailure);
+      }
+    }
+
+    private void enqueueCurrentBuffer() throws IOException {
+
+      byte[] part = buffer.toByteArray();
+      buffer.reset();
+
+      try {
+        queue.put(new Part(partNumber++, part, false));
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+        throw new IOException(e);
+      }
+    }
+
+    private void runUploader(S3Client s3, String bucket, String key) {
+
+      String uploadId = null;
+
+      try {
+
+        CreateMultipartUploadResponse create =
+            s3.createMultipartUpload(
+                CreateMultipartUploadRequest.builder().bucket(bucket).key(key).build());
+
+        uploadId = create.uploadId();
+
+        List<CompletedPart> completedParts = new ArrayList<>();
+
+        while (true) {
+
+          Part part = queue.take();
+
+          if (part.isEof()) {
+            break;
+          }
+
+          UploadPartResponse response =
+              s3.uploadPart(
+                  UploadPartRequest.builder()
+                      .bucket(bucket)
+                      .key(key)
+                      .uploadId(uploadId)
+                      .partNumber(part.getPartNumber())
+                      .build(),
+                  RequestBody.fromBytes(part.getData()));
+
+          completedParts.add(
+              CompletedPart.builder()
+                  .partNumber(part.getPartNumber())
+                  .eTag(response.eTag())
+                  .build());
+        }
+
+        s3.completeMultipartUpload(
+            CompleteMultipartUploadRequest.builder()
+                .bucket(bucket)
+                .key(key)
+                .uploadId(uploadId)
+                .multipartUpload(CompletedMultipartUpload.builder().parts(completedParts).build())
+                .build());
+
+      } catch (Throwable t) {
+
+        uploadFailure = t;
+
+        if (uploadId != null) {
+          try {
+            s3.abortMultipartUpload(
+                AbortMultipartUploadRequest.builder()
+                    .bucket(bucket)
+                    .key(key)
+                    .uploadId(uploadId)
+                    .build());
+          } catch (Exception ignored) {
+          }
+        }
+
+        throw new RuntimeException(t);
+      }
+    }
+
+    /** Represents a part to be uploaded (simple POJO as in Java 1.8 we don't have records yet) */
+    private class Part {
+      private final int partNumber;
+      private final byte[] data;
+      private final boolean eof;
+
+      public Part(int partNumber, byte[] data, boolean eof) {
+        super();
+        this.partNumber = partNumber;
+        this.data = data;
+        this.eof = eof;
+      }
+
+      private int getPartNumber() {
+        return partNumber;
+      }
+
+      private byte[] getData() {
+        return data;
+      }
+
+      private boolean isEof() {
+        return eof;
+      }
     }
   }
 }
